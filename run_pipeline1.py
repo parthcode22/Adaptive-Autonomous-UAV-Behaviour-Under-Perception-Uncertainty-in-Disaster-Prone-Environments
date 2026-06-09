@@ -1,218 +1,238 @@
 import cv2
 import numpy as np
+import sys
+import os
 
-from perception.depth_estimator import DepthEstimator
+# ── Add project root to path ──
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from perception.depth_estimator      import DepthEstimator
 from perception.confidence_estimator import ConfidenceEstimator
-from perception.sensor_manager import SensorManager
+from perception.sensor_manager       import SensorManager
+from Objectdetection.detector        import DynamicObstacleDetector
 
+class UAVPipeline:
+    def __init__(self):
+        print("[Pipeline] Loading all modules...")
+        self.depth_est   = DepthEstimator()
+        self.conf_est    = ConfidenceEstimator()
+        self.sensor_mgr  = SensorManager()
+        self.detector    = DynamicObstacleDetector()
 
-# ==================================
-# Initialize Modules
-# ==================================
+        self.conf_history   = []
+        self.switch_counter = 0
+        self.SWITCH_WINDOW  = 45
 
-depth_estimator = DepthEstimator()
-confidence_estimator = ConfidenceEstimator()
-sensor_manager = SensorManager()
+        print("[Pipeline] All modules ready.")
 
+    def laplacian_confidence(self, frame):
+        gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        lap      = cv2.Laplacian(gray, cv2.CV_64F)
+        variance = lap.var()
+        conf     = float(np.clip(variance / 3000.0, 0.0, 1.0))
+        return conf
 
-# ==================================
-# Webcam
-# ==================================
+    def get_tier(self, conf):
+        if conf   >= 0.80: return "HIGH",     (0, 255, 0)
+        elif conf >= 0.50: return "MODERATE", (0, 255, 255)
+        elif conf >= 0.30: return "LOW",      (0, 165, 255)
+        else:              return "DANGER",   (0, 0, 255)
 
-cap = cv2.VideoCapture(0)
+    def run(self):
+        cap           = cv2.VideoCapture(0)
+        active_sensor = "rgb"
+        switch_counter = 0
 
-if not cap.isOpened():
-    print("Error: Could not open webcam.")
-    exit()
+        print("[Pipeline] Running... Press Q to quit")
+        print("-" * 60)
 
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-# ==================================
-# Main Loop
-# ==================================
+            # ── Step 1: Resize ──
+            frame = cv2.resize(frame, (640, 480))
 
-while True:
+            # ── Step 2: Laplacian confidence ──
+            lap_conf = self.laplacian_confidence(frame)
+            self.conf_history.append(lap_conf)
+            if len(self.conf_history) > self.SWITCH_WINDOW:
+                self.conf_history.pop(0)
+            mean_conf = float(np.mean(self.conf_history))
 
-    ret, frame = cap.read()
+            # ── Step 3: Sensor switching ──
+            if active_sensor == "rgb":
+                if mean_conf < 0.30:
+                    switch_counter += 1
+                    if switch_counter >= self.SWITCH_WINDOW:
+                        active_sensor  = "ir"
+                        switch_counter = 0
+                        print("[SWITCH] RGB → IR")
+                else:
+                    switch_counter = 0
 
-    if not ret:
-        print("Error: Could not read frame.")
-        break
+            elif active_sensor == "ir":
+                if mean_conf < 0.30:
+                    switch_counter += 1
+                    if switch_counter >= self.SWITCH_WINDOW:
+                        active_sensor  = "thermal"
+                        switch_counter = 0
+                        print("[SWITCH] IR → Thermal")
+                elif mean_conf > 0.50:
+                    active_sensor  = "rgb"
+                    switch_counter = 0
+                    print("[RECOVER] IR → RGB")
 
-    # ==================================
-    # Depth Estimation
-    # ==================================
+            # ── Step 4: Apply sensor simulation ──
+            active_frame, mode, sensor = \
+                self.sensor_mgr.get_active_frame(frame, mean_conf)
 
-    depth = depth_estimator.predict(frame)
+            # ── Step 5: MiDaS depth ──
+            depth = self.depth_est.predict(active_frame)
 
-    # ==================================
-    # Confidence Estimation
-    # ==================================
+            # ── Step 6: Confidence from frame + depth ──
+            conf_map, mean_conf_depth = self.conf_est.estimate(
+                active_frame, depth
+            )
 
-    conf_map, mean_conf = confidence_estimator.estimate(
-        frame,
-        depth
-    )
+            # Regional confidence
+            w = conf_map.shape[1]
+            regions = {
+                "left"  : float(np.mean(conf_map[:, :w//3])),
+                "center": float(np.mean(conf_map[:, w//3:2*w//3])),
+                "right" : float(np.mean(conf_map[:, 2*w//3:]))
+            }
 
-    confidence_state = (
-        confidence_estimator.confidence_state(
-            mean_conf
-        )
-    )
+            # ── Step 7: YOLO detection ──
+            detections    = self.detector.detect(frame)
+            dynamic_flags = []
+            victims       = []
 
-    # ==================================
-    # Sensor Selection
-    # ==================================
+            for det in detections:
+                is_moving, flow = self.detector.is_dynamic(
+                    frame, det["box"]
+                )
+                dynamic_flags.append(is_moving)
 
-    sensor = sensor_manager.choose_sensor(
-        mean_conf
-    )
+                if det["label"] == "person" and not is_moving:
+                    det["is_victim"] = True
+                    victims.append(det["center"])
+                else:
+                    det["is_victim"] = False
 
-    # ==================================
-    # RGB / IR / THERMAL
-    # ==================================
+            frame_det = self.detector.draw(
+                frame.copy(), detections, dynamic_flags
+            )
 
-    if sensor == "RGB":
+            # ── Step 8: Depth + confidence visualisation ──
+            d_vis = cv2.normalize(
+                depth, None, 0, 255, cv2.NORM_MINMAX
+            ).astype('uint8')
+            d_col = cv2.applyColorMap(d_vis, cv2.COLORMAP_MAGMA)
+            c_vis = (conf_map * 255).astype('uint8')
+            c_col = cv2.applyColorMap(c_vis, cv2.COLORMAP_VIRIDIS)
 
-        display_frame = frame.copy()
+            d_col = cv2.resize(d_col, (640, 480))
+            c_col = cv2.resize(c_col, (640, 480))
 
-    elif sensor == "IR":
+            # ── Step 9: HUD overlay ──
+            tier, color = self.get_tier(mean_conf)
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
+            cv2.putText(frame_det,
+                f"Sensor: {active_sensor.upper()} | "
+                f"Conf: {mean_conf:.3f} | "
+                f"Tier: {tier}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 2)
 
-        display_frame = cv2.applyColorMap(
-            gray,
-            cv2.COLORMAP_BONE
-        )
+            cv2.putText(frame_det,
+                f"Objects: {len(detections)} | "
+                f"Dynamic: {sum(dynamic_flags)} | "
+                f"Victims: {len(victims)}",
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 2)
 
-    else:
+            cv2.putText(frame_det,
+                f"L:{regions['left']:.2f} | "
+                f"C:{regions['center']:.2f} | "
+                f"R:{regions['right']:.2f}",
+                (10, 90), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 2)
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
+            cv2.putText(d_col,
+                "DEPTH MAP",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (255, 255, 255), 2)
 
-        display_frame = cv2.applyColorMap(
-            gray,
-            cv2.COLORMAP_JET
-        )
+            cv2.putText(c_col,
+                f"CONFIDENCE | Mean: {mean_conf_depth:.3f}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (255, 255, 255), 2)
 
-    # ==================================
-    # Depth Visualization
-    # ==================================
+            # ── Step 10: Stack all views ──
+            top     = np.hstack([frame_det, d_col])
+            bottom  = np.hstack([c_col,
+                self.info_panel(
+                    mean_conf, tier, color,
+                    active_sensor, detections,
+                    dynamic_flags, victims
+                )
+            ])
+            display = np.vstack([top, bottom])
+            display = cv2.resize(display, (1280, 720))
 
-    depth_display = cv2.normalize(
-        depth,
-        None,
-        0,
-        255,
-        cv2.NORM_MINMAX
-    )
+            cv2.imshow("UAV Perception Pipeline", display)
 
-    depth_display = depth_display.astype(
-        np.uint8
-    )
+            if victims:
+                print(f"VICTIM at {victims}")
 
-    depth_display = cv2.applyColorMap(
-        depth_display,
-        cv2.COLORMAP_MAGMA
-    )
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-    # ==================================
-    # Confidence Visualization
-    # ==================================
+        cap.release()
+        cv2.destroyAllWindows()
 
-    conf_display = (
-        conf_map * 255
-    ).astype(np.uint8)
+    def info_panel(self, conf, tier, color,
+                   sensor, detections, dynamic_flags, victims):
+        panel      = np.zeros((480, 640, 3), dtype=np.uint8)
+        panel[:]   = (30, 30, 30)
 
-    conf_display = cv2.applyColorMap(
-        conf_display,
-        cv2.COLORMAP_VIRIDIS
-    )
-
-    # ==================================
-    # Overlay Information
-    # ==================================
-
-    cv2.putText(
-        display_frame,
-        f"Confidence: {mean_conf:.2f}",
-        (20, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        display_frame,
-        f"State: {confidence_state}",
-        (20, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        display_frame,
-        f"Sensor: {sensor}",
-        (20, 90),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0),
-        2
-    )
-
-    # ==================================
-    # Resize Panels
-    # ==================================
-
-    h, w = frame.shape[:2]
-
-    depth_display = cv2.resize(
-        depth_display,
-        (w, h)
-    )
-
-    conf_display = cv2.resize(
-        conf_display,
-        (w, h)
-    )
-
-    # ==================================
-    # Combine Views
-    # ==================================
-
-    combined = np.hstack(
-        [
-            display_frame,
-            depth_display,
-            conf_display
+        lines = [
+            ("UAV PERCEPTION SYSTEM",          (255, 255, 255)),
+            ("",                                (255, 255, 255)),
+            (f"Active sensor : {sensor.upper()}", color),
+            (f"Confidence    : {conf:.3f}",       color),
+            (f"Tier          : {tier}",            color),
+            ("",                                (255, 255, 255)),
+            (f"Objects found : {len(detections)}", (200, 200, 200)),
+            (f"Dynamic obs   : {sum(dynamic_flags)}", (0, 0, 255)),
+            (f"Victims found : {len(victims)}",   (0, 165, 255)),
+            ("",                                (255, 255, 255)),
+            ("Confidence tiers:",               (200, 200, 200)),
+            ("HIGH     0.80-1.00 Normal flight",(0, 255, 0)),
+            ("MODERATE 0.50-0.79 Reduce speed", (0, 255, 255)),
+            ("LOW      0.30-0.49 Safety margin",(0, 165, 255)),
+            ("DANGER   0.00-0.29 Switch sensor",(0, 0, 255)),
+            ("",                                (255, 255, 255)),
+            ("Orange = Victim",                 (0, 165, 255)),
+            ("Red    = Dynamic obstacle",       (0, 0, 255)),
+            ("Green  = Static obstacle",        (0, 255, 0)),
         ]
-    )
 
-    # ==================================
-    # Show Output
-    # ==================================
+        y = 30
+        for text, col in lines:
+            cv2.putText(
+                panel, text, (20, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, col, 1
+            )
+            y += 28
 
-    cv2.imshow(
-        "Confidence-Aware UAV Perception",
-        combined
-    )
-
-    key = cv2.waitKey(1)
-
-    if key == 27:  # ESC
-        break
+        return panel
 
 
-# ==================================
-# Cleanup
-# ==================================
-
-cap.release()
-cv2.destroyAllWindows()
+# ── Run ──
+if __name__ == "__main__":
+    pipeline = UAVPipeline()
+    pipeline.run()
