@@ -10,8 +10,10 @@ from perception.depth_estimator      import DepthEstimator
 from perception.sensor_manager       import SensorManager
 from Victimdetection.detector        import DynamicObstacleDetector
 from Uncertainity.Coherence_map      import CoherenceMapComputer
-from fusion_1.fusion_pipeline          import FusionPipeline, FusionPipelineConfig
-from fusion_1.fusion_engine            import GaborPipelineOutput, OdometryInput
+from fusion_1.fusion_pipeline        import FusionPipeline, FusionPipelineConfig
+from fusion_1.fusion_engine          import GaborPipelineOutput, OdometryInput, LidarPipelineOutput
+from lidar.lidar_pipeline            import LidarPipeline, LidarPipelineConfig, to_fusion_output
+from lidar.echo_physics              import EchoReturn, LidarPulse
 
 
 class UAVPipeline:
@@ -23,15 +25,21 @@ class UAVPipeline:
         self.coherence   = CoherenceMapComputer()
 
         # ── Fusion layer ──
-        # lidar_available=False → neutral LiDAR fallback used automatically
-        # until lidar/ module is built. No other change needed later —
-        # just flip this to True and pass a real LidarPipelineOutput.
+        # lidar_available=True → real LidarPipelineOutput now feeds in,
+        # built from placeholder pulses until a real sensor/Gazebo feed
+        # is connected (see _generate_placeholder_pulses below).
         fusion_cfg       = FusionPipelineConfig(
-            lidar_available  = False,
+            lidar_available  = True,
             log_to_console   = False,
             history_length   = 30,
         )
         self.fusion      = FusionPipeline(config=fusion_cfg)
+
+        # ── LiDAR module ──
+        # Stateful pipeline — holds TemporalTracker history across scans.
+        self.lidar_pipeline = LidarPipeline(
+            config=LidarPipelineConfig(log_to_console=False)
+        )
 
         print("[Pipeline] All modules ready.")
 
@@ -61,6 +69,37 @@ class UAVPipeline:
             danger_pixel_fraction  = float(coh_result.get("danger_ratio",0.0)),
         )
 
+    def _generate_placeholder_pulses(self, gabor_confidence: float) -> list:
+        """
+        TEMPORARY: generates placeholder LidarPulse objects until a real
+        LiDAR sensor / Gazebo feed is connected. Pulse behavior is loosely
+        tied to gabor_confidence so the placeholder isn't fully disconnected
+        from the rest of the scene — clearer visual scenes simulate a
+        clean wall-like return, smokier scenes simulate degraded/absorbed
+        returns. Replace this method entirely once real sensor data exists.
+        """
+        rng = np.random.default_rng()
+
+        pulses = []
+        for az in np.linspace(-0.04, 0.04, 10):
+            for el in np.linspace(-0.02, 0.02, 4):
+                if gabor_confidence > 0.5:
+                    # Clearer scene -> simulate a clean wall-like return
+                    d = 5.0 + rng.normal(0, 0.05)
+                    echoes = [EchoReturn(distance=d, intensity=0.4, echo_index=0, total_echoes=1)]
+                else:
+                    # Smokier scene -> simulate degraded/absorbed returns
+                    if rng.random() < 0.5:
+                        echoes = []  # total absorption
+                    else:
+                        d = rng.uniform(1.0, 3.0)
+                        i = rng.uniform(0.05, 0.15)
+                        echoes = [EchoReturn(distance=d, intensity=i, echo_index=0, total_echoes=1)]
+                pulses.append(LidarPulse(
+                    echoes=echoes, beam_azimuth=az, beam_elevation=el, timestamp=time.time()
+                ))
+        return pulses
+
     def get_tier(self, conf):
         if conf >= 0.45:
             return "SAFE", (0, 255, 0)
@@ -77,7 +116,7 @@ class UAVPipeline:
         }.get(nav_state, (200, 200, 200))
 
     # ------------------------------------------------------------------
-    # Metrics panel — now shows fusion UPS fields alongside existing data
+    # Metrics panel — now shows fusion UPS fields + LiDAR fields
     # ------------------------------------------------------------------
 
     def metrics_panel(self, result, tier, color,
@@ -191,7 +230,32 @@ class UAVPipeline:
 
         y += 4
 
-        # ── Section 5: Detection ─────────────────────────────────────
+        # ── Section 5: LiDAR (NEW) ───────────────────────────────────
+        cv2.putText(panel, "LIDAR (multi-echo)",
+            (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+            0.42, (150, 150, 150), 1)
+        cv2.line(panel, (10, y+6), (630, y+6), (50, 50, 50), 1)
+        y += 18
+
+        lidar_lines = [
+            (f"p_surface: {fusion_metrics.get('lidar_p_surface', 0.0):.3f}   "
+             f"p_smoke: {fusion_metrics.get('lidar_p_smoke', 0.0):.3f}",
+             (200, 200, 200)),
+            (f"spatial_consistency: {fusion_metrics.get('lidar_spatial', 0.0):.3f}   "
+             f"valid_echo: {fusion_metrics.get('lidar_valid_echo', 0.0):.3f}",
+             (200, 200, 200)),
+            (f"beta_estimate: {fusion_metrics.get('lidar_beta', 0.0):.3f}   "
+             f"obstacle_prox: {fusion_metrics.get('lidar_obstacle_prox', 0.0):.3f}",
+             (180, 180, 100)),
+        ]
+        for text, col in lidar_lines:
+            cv2.putText(panel, text, (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1)
+            y += 16
+
+        y += 4
+
+        # ── Section 6: Detection ─────────────────────────────────────
         cv2.putText(panel, "DETECTION",
             (10, y), cv2.FONT_HERSHEY_SIMPLEX,
             0.42, (150, 150, 150), 1)
@@ -239,6 +303,14 @@ class UAVPipeline:
         # initialise fusion_metrics so metrics_panel never crashes on
         # the first few frames before the first heavy processing block
         fusion_metrics = self.fusion.get_display_metrics()
+        fusion_metrics.update({
+            "lidar_p_surface"     : 0.0,
+            "lidar_p_smoke"       : 0.0,
+            "lidar_spatial"       : 0.0,
+            "lidar_valid_echo"    : 0.0,
+            "lidar_beta"          : 0.0,
+            "lidar_obstacle_prox" : 0.0,
+        })
 
         print("[Pipeline] Running... Press Q to quit")
         print("-" * 60)
@@ -296,22 +368,42 @@ class UAVPipeline:
                         active_frame, det["box"])
                     dynamic_flags.append(is_moving)
 
-                # ── Fusion update ─────────────────────────────────────
-                # Build GaborPipelineOutput from coh_result
+                # ── Build GaborPipelineOutput from coh_result ─────────
                 gabor_out = self._build_gabor_output(coh_result)
 
-                # Update fusion pipeline
-                # lidar=None  → neutral fallback (LiDAR not built yet)
-                # radar_flag=0 → UWB not integrated yet
+                # ── Run LiDAR pipeline (placeholder pulses for now) ───
+                pulses       = self._generate_placeholder_pulses(gabor_out.global_confidence)
+                lidar_result = self.lidar_pipeline.process_scan(pulses)
+                bridge       = to_fusion_output(lidar_result)
+
+                lidar_out = LidarPipelineOutput(
+                    p_surface            = bridge.p_surface,
+                    p_smoke              = bridge.p_smoke,
+                    p_unknown            = bridge.p_unknown,
+                    spatial_consistency  = bridge.spatial_consistency,
+                    valid_echo_fraction  = bridge.valid_echo_fraction,
+                    beta_estimate        = bridge.beta_estimate,
+                    obstacle_proximity   = bridge.obstacle_proximity,
+                )
+
+                # ── Fusion update (real Gabor + real LiDAR output) ───
                 ups = self.fusion.update(
                     gabor      = gabor_out,
-                    lidar      = None,
+                    lidar      = lidar_out,
                     odometry   = OdometryInput(),   # stationary for now
                     radar_flag = 0,
                 )
 
                 # Pull display metrics once per heavy block
                 fusion_metrics = self.fusion.get_display_metrics()
+                fusion_metrics.update({
+                    "lidar_p_surface"     : bridge.p_surface,
+                    "lidar_p_smoke"       : bridge.p_smoke,
+                    "lidar_spatial"       : bridge.spatial_consistency,
+                    "lidar_valid_echo"    : bridge.valid_echo_fraction,
+                    "lidar_beta"          : bridge.beta_estimate,
+                    "lidar_obstacle_prox" : bridge.obstacle_proximity,
+                })
 
                 cached = dict(
                     coh_result    = coh_result,
@@ -387,7 +479,7 @@ class UAVPipeline:
                 coh_result, tier, color,
                 detections, dynamic_flags,
                 fps,
-                fusion_metrics,        # ← new argument
+                fusion_metrics,
             )
 
             # ── Compose 2×2 grid ──────────────────────────────────────

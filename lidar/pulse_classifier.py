@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import List
 import numpy as np
 
-from echo_physics import LidarPulse, PulsePhysicsFeatures, PhysicsConstants
+from .echo_physics import LidarPulse, PulsePhysicsFeatures, PhysicsConstants
 
 class ClassifierConstants:
     """

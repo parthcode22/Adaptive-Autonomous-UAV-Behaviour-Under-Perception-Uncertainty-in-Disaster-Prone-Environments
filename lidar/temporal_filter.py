@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Deque, List, Optional
 import numpy as np
 
-from spatial_filter import SpatialPoint
+from .spatial_filter import SpatialPoint
 
 
 # ---------------------------------------------------------------------------
