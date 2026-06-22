@@ -9,7 +9,7 @@ to produce the Unified Perceptual State (UPS) vector each cycle.
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 import time
 
@@ -25,6 +25,8 @@ from .sensor_weights import (
     VisualReliabilityInput,
     LidarReliabilityInput,
 )
+
+
 @dataclass
 class GaborPipelineOutput:
     """
@@ -65,7 +67,6 @@ class GaborPipelineOutput:
 class LidarPipelineOutput:
     """
     Everything the LiDAR multi-echo pipeline produces per scan.
-    Will be populated once lidar/ module is built.
     """
     p_surface            : float
     p_smoke              : float
@@ -97,11 +98,26 @@ class LidarPipelineOutput:
 
 @dataclass
 class OdometryInput:
-    """Body-frame velocity and yaw rate from onboard odometry."""
+    """
+    Body-frame velocity, yaw rate, AND absolute position from onboard
+    odometry (PX4/ArduPilot VIO/SLAM estimate, GPS-denied).
+
+    Position fields (x, y, z) were added to support distance_to_last_signal
+    tracking in FusionEngine — real flight stacks already expose position
+    alongside velocity, so this is received, not derived/integrated here.
+    """
     vx       : float = 0.0
     vy       : float = 0.0
     vz       : float = 0.0
     yaw_rate : float = 0.0
+    x        : float = 0.0
+    y        : float = 0.0
+    z        : float = 0.0
+
+    def position(self) -> Tuple[float, float, float]:
+        """Convenience accessor for the (x, y, z) tuple."""
+        return (self.x, self.y, self.z)
+
 
 class FusionEngine:
 
@@ -124,7 +140,11 @@ class FusionEngine:
         smoke_w_visual_inv       : float = 0.30,
         smoke_w_lidar_smoke      : float = 0.20,
 
-        beta_max                 : float = 1.5,
+        beta_max                  : float = 1.5,
+
+        # distance_to_last_signal normalization — beyond this distance,
+        # the normalized value saturates at 1.0 ("far")
+        max_signal_distance       : float = 50.0,
     ):
         self.weight_computer          = weight_computer or SensorWeightComputer()
         self.thresh                   = thresh          or FusionThresholds()
@@ -141,11 +161,15 @@ class FusionEngine:
         self.smoke_w_lidar_smoke      = smoke_w_lidar_smoke
 
         self.beta_max                 = beta_max
+        self.max_signal_distance      = max_signal_distance
 
         # stateful fields
-        self._danger_timer   : float           = 0.0
-        self._last_nav_state : NavigationState = NavigationState.SAFE
-        self._last_timestamp : float           = time.time()
+        self._danger_timer        : float                           = 0.0
+        self._last_nav_state      : NavigationState                 = NavigationState.SAFE
+        self._last_timestamp      : float                           = time.time()
+        self._last_signal_position: Optional[Tuple[float, float, float]] = None
+        self._last_distance_to_signal: float                        = 1.0
+
     def fuse(
         self,
         gabor      : GaborPipelineOutput,
@@ -198,7 +222,13 @@ class FusionEngine:
             scene_conf, obs_conf, w_v, w_l, self._danger_timer, self.thresh
         )
 
-        # 10. construct and return UPS
+        # 10. update distance_to_last_signal (tracks UAV position vs. most
+        #     recent radar_flag=1 trigger location)
+        self._last_distance_to_signal = self._update_signal_distance(
+            radar_flag, odometry.position()
+        )
+
+        # 11. construct and return UPS
         ups = UnifiedPerceptualState(
             scene_confidence    = scene_conf,
             obstacle_confidence = obs_conf,
@@ -221,6 +251,15 @@ class FusionEngine:
 
         self._last_nav_state = nav_state
         return ups
+
+    def get_distance_to_last_signal(self) -> float:
+        """
+        Most recently computed distance_to_last_signal, normalized [0, 1].
+        1.0 = no signal ever detected this mission, or signal is farther
+        than max_signal_distance away. Call after fuse().
+        """
+        return self._last_distance_to_signal
+
     def _fuse_scene_confidence(
         self,
         gabor : GaborPipelineOutput,
@@ -276,6 +315,7 @@ class FusionEngine:
                  self.smoke_w_lidar_smoke * lidar_smoke)
 
         return float(np.clip(fused, 0.0, 1.0))
+
     def _update_danger_timer(
         self,
         nav_state : NavigationState,
@@ -289,8 +329,39 @@ class FusionEngine:
             return self._danger_timer + dt
         return 0.0
 
+    def _update_signal_distance(
+        self,
+        radar_flag       : int,
+        current_position : Tuple[float, float, float],
+    ) -> float:
+        """
+        Update last_signal_position if radar just triggered, then compute
+        the normalized distance from current position to the most recent
+        signal location.
+
+        Returns
+        -------
+        float — distance_to_last_signal, normalized [0, 1].
+                1.0 = no signal ever detected this mission, OR signal is
+                farther than max_signal_distance away.
+        """
+        if radar_flag == 1:
+            self._last_signal_position = current_position
+
+        if self._last_signal_position is None:
+            return 1.0
+
+        dx = current_position[0] - self._last_signal_position[0]
+        dy = current_position[1] - self._last_signal_position[1]
+        dz = current_position[2] - self._last_signal_position[2]
+        raw_distance = (dx**2 + dy**2 + dz**2) ** 0.5
+
+        return float(min(raw_distance / self.max_signal_distance, 1.0))
+
     def reset(self):
         """Call between missions or test runs."""
-        self._danger_timer   = 0.0
-        self._last_nav_state = NavigationState.SAFE
-        self._last_timestamp = time.time()
+        self._danger_timer            = 0.0
+        self._last_nav_state          = NavigationState.SAFE
+        self._last_timestamp          = time.time()
+        self._last_signal_position    = None
+        self._last_distance_to_signal = 1.0 
